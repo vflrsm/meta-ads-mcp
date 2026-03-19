@@ -1,0 +1,19 @@
+{
+  "name": "meta-ads-mcp",
+  "version": "1.0.0",
+  "description": "MCP server para Meta Ads CSCO - by DEVAL",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.2",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "zod": "^3.24.2"
+  }
+}
