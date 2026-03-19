@@ -43,17 +43,13 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        account_id: { type: "string", description: "ID de la cuenta. Ej: act_1295766891808765" },
+        account_id: { type: "string", description: "ID de la cuenta." },
         date_preset: {
           type: "string",
           enum: ["today", "yesterday", "last_7d", "last_14d", "last_30d", "this_month", "last_month"],
           default: "last_30d",
         },
-        level: {
-          type: "string",
-          enum: ["account", "campaign", "adset", "ad"],
-          default: "campaign",
-        },
+        level: { type: "string", enum: ["account", "campaign", "adset", "ad"], default: "campaign" },
       },
       required: ["account_id"],
     },
@@ -78,9 +74,7 @@ const TOOLS = [
     description: "Devuelve los adsets de una campaña específica.",
     inputSchema: {
       type: "object",
-      properties: {
-        campaign_id: { type: "string", description: "ID de la campaña" },
-      },
+      properties: { campaign_id: { type: "string" } },
       required: ["campaign_id"],
     },
   },
@@ -95,14 +89,14 @@ async function callTool(name, args) {
     COLE_HAAN:     "act_432698772427150",
   };
 
-  if (name === "get_ad_accounts") {
-    return metaGet("/me/adaccounts", { fields: "id,name,currency,account_status" });
-  }
+  if (name === "get_ad_accounts") return metaGet("/me/adaccounts", { fields: "id,name,currency,account_status" });
+
   if (name === "get_campaigns") {
     const params = { fields: "id,name,status,objective,daily_budget,lifetime_budget" };
     if (args.status && args.status !== "ALL") params.effective_status = `["${args.status}"]`;
     return metaGet(`/${args.account_id}/campaigns`, params);
   }
+
   if (name === "get_insights") {
     return metaGet(`/${args.account_id}/insights`, {
       fields: "campaign_name,adset_name,spend,impressions,clicks,ctr,cpc,cpm,actions,action_values",
@@ -111,6 +105,7 @@ async function callTool(name, args) {
       limit: 20,
     });
   }
+
   if (name === "compare_brands") {
     const preset = args.date_preset || "this_month";
     const results = await Promise.all(
@@ -123,57 +118,87 @@ async function callTool(name, args) {
           });
           const d = data.data?.[0] || {};
           const spend = parseFloat(d.spend || 0);
-          const purchaseValue = parseFloat(
-            d.action_values?.find((a) => a.action_type === "purchase")?.value || 0
-          );
+          const purchaseValue = parseFloat(d.action_values?.find(a => a.action_type === "purchase")?.value || 0);
           const roas = spend > 0 ? (purchaseValue / spend).toFixed(2) : "N/A";
           return { brand, spend: `$${spend.toFixed(2)}`, roas, ctr: d.ctr ? `${parseFloat(d.ctr).toFixed(2)}%` : "N/A", impressions: d.impressions || "0" };
-        } catch (e) {
-          return { brand, error: e.message };
-        }
+        } catch (e) { return { brand, error: e.message }; }
       })
     );
     return { period: preset, brands: results };
   }
+
   if (name === "get_adsets") {
-    return metaGet(`/${args.campaign_id}/adsets`, {
-      fields: "id,name,status,daily_budget,targeting,optimization_goal,start_time,end_time",
-    });
+    return metaGet(`/${args.campaign_id}/adsets`, { fields: "id,name,status,daily_budget,targeting,optimization_goal" });
   }
+
   throw new Error(`Tool not found: ${name}`);
 }
 
-function mcpReply(res, id, result) {
-  res.json({ jsonrpc: "2.0", id, result });
-}
-function mcpError(res, id, code, message) {
-  res.json({ jsonrpc: "2.0", id, error: { code, message } });
-}
+// SSE sessions store
+const sessions = new Map();
 
+// GET /mcp — SSE stream (required by claude.ai Streamable HTTP transport)
 app.get("/mcp", (req, res) => {
-  res.json({ status: "ok", server: "meta-ads-csco", version: "1.0.0" });
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  const sessionId = Math.random().toString(36).slice(2);
+  sessions.set(sessionId, res);
+
+  // Send endpoint event so client knows where to POST
+  const postUrl = `${req.protocol}://${req.get("host")}/mcp?sessionId=${sessionId}`;
+  res.write(`event: endpoint\ndata: ${postUrl}\n\n`);
+
+  req.on("close", () => sessions.delete(sessionId));
 });
 
+// POST /mcp — handle JSON-RPC messages
 app.post("/mcp", async (req, res) => {
+  const sessionId = req.query.sessionId;
+  const sseRes = sessionId ? sessions.get(sessionId) : null;
+
   const { id, method, params } = req.body;
+
+  const sendReply = (result) => {
+    const msg = JSON.stringify({ jsonrpc: "2.0", id, result });
+    if (sseRes) {
+      sseRes.write(`event: message\ndata: ${msg}\n\n`);
+      res.status(202).end();
+    } else {
+      res.json({ jsonrpc: "2.0", id, result });
+    }
+  };
+
+  const sendError = (code, message) => {
+    const msg = JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } });
+    if (sseRes) {
+      sseRes.write(`event: message\ndata: ${msg}\n\n`);
+      res.status(202).end();
+    } else {
+      res.json({ jsonrpc: "2.0", id, error: { code, message } });
+    }
+  };
+
   try {
     if (method === "initialize") {
-      return mcpReply(res, id, {
+      return sendReply({
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
         serverInfo: { name: "meta-ads-csco", version: "1.0.0" },
       });
     }
-    if (method === "notifications/initialized") return res.status(200).json({});
-    if (method === "tools/list") return mcpReply(res, id, { tools: TOOLS });
+    if (method === "notifications/initialized") return res.status(200).end();
+    if (method === "tools/list") return sendReply({ tools: TOOLS });
     if (method === "tools/call") {
       const { name, arguments: args } = params;
       const result = await callTool(name, args || {});
-      return mcpReply(res, id, { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] });
+      return sendReply({ content: [{ type: "text", text: JSON.stringify(result, null, 2) }] });
     }
-    return mcpError(res, id, -32601, `Method not found: ${method}`);
+    return sendError(-32601, `Method not found: ${method}`);
   } catch (e) {
-    return mcpError(res, id, -32603, e.message);
+    return sendError(-32603, e.message);
   }
 });
 
