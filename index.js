@@ -1,13 +1,13 @@
 import express from "express";
 import cors from "cors";
-import { z } from "zod";
 
 const META_TOKEN = process.env.META_ACCESS_TOKEN;
 const META_API = "https://graph.facebook.com/v25.0";
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
 app.use(express.json());
+app.options("*", cors());
 
 async function metaGet(path, params = {}) {
   const url = new URL(`${META_API}${path}`);
@@ -39,7 +39,7 @@ const TOOLS = [
   },
   {
     name: "get_insights",
-    description: "Devuelve métricas de rendimiento (gasto, ROAS, CTR, CPC, resultados) de una cuenta.",
+    description: "Devuelve métricas de rendimiento (gasto, ROAS, CTR, CPC) de una cuenta de Meta Ads.",
     inputSchema: {
       type: "object",
       properties: {
@@ -60,7 +60,7 @@ const TOOLS = [
   },
   {
     name: "compare_brands",
-    description: "Compara métricas de gasto y ROAS entre todas las marcas CSCO (FLORSHEIM, LOS MUCHACHOS, ISOLA, PUMA, COLE HAAN).",
+    description: "Compara métricas de gasto y ROAS entre todas las marcas CSCO: FLORSHEIM, LOS MUCHACHOS, ISOLA, PUMA, COLE HAAN.",
     inputSchema: {
       type: "object",
       properties: {
@@ -98,13 +98,11 @@ async function callTool(name, args) {
   if (name === "get_ad_accounts") {
     return metaGet("/me/adaccounts", { fields: "id,name,currency,account_status" });
   }
-
   if (name === "get_campaigns") {
     const params = { fields: "id,name,status,objective,daily_budget,lifetime_budget" };
     if (args.status && args.status !== "ALL") params.effective_status = `["${args.status}"]`;
     return metaGet(`/${args.account_id}/campaigns`, params);
   }
-
   if (name === "get_insights") {
     return metaGet(`/${args.account_id}/insights`, {
       fields: "campaign_name,adset_name,spend,impressions,clicks,ctr,cpc,cpm,actions,action_values",
@@ -113,7 +111,6 @@ async function callTool(name, args) {
       limit: 20,
     });
   }
-
   if (name === "compare_brands") {
     const preset = args.date_preset || "this_month";
     const results = await Promise.all(
@@ -130,14 +127,7 @@ async function callTool(name, args) {
             d.action_values?.find((a) => a.action_type === "purchase")?.value || 0
           );
           const roas = spend > 0 ? (purchaseValue / spend).toFixed(2) : "N/A";
-          return {
-            brand,
-            spend: `$${spend.toFixed(2)}`,
-            roas,
-            ctr: d.ctr ? `${parseFloat(d.ctr).toFixed(2)}%` : "N/A",
-            impressions: d.impressions || "0",
-            clicks: d.clicks || "0",
-          };
+          return { brand, spend: `$${spend.toFixed(2)}`, roas, ctr: d.ctr ? `${parseFloat(d.ctr).toFixed(2)}%` : "N/A", impressions: d.impressions || "0" };
         } catch (e) {
           return { brand, error: e.message };
         }
@@ -145,52 +135,45 @@ async function callTool(name, args) {
     );
     return { period: preset, brands: results };
   }
-
   if (name === "get_adsets") {
     return metaGet(`/${args.campaign_id}/adsets`, {
       fields: "id,name,status,daily_budget,targeting,optimization_goal,start_time,end_time",
     });
   }
-
   throw new Error(`Tool not found: ${name}`);
 }
 
-// ── MCP endpoint ──────────────────────────────────────────────────────────────
+function mcpReply(res, id, result) {
+  res.json({ jsonrpc: "2.0", id, result });
+}
+function mcpError(res, id, code, message) {
+  res.json({ jsonrpc: "2.0", id, error: { code, message } });
+}
+
+app.get("/mcp", (req, res) => {
+  res.json({ status: "ok", server: "meta-ads-csco", version: "1.0.0" });
+});
 
 app.post("/mcp", async (req, res) => {
-  const { jsonrpc, id, method, params } = req.body;
-
-  const reply = (result) => res.json({ jsonrpc: "2.0", id, result });
-  const error = (code, message) => res.json({ jsonrpc: "2.0", id, error: { code, message } });
-
+  const { id, method, params } = req.body;
   try {
     if (method === "initialize") {
-      return reply({
+      return mcpReply(res, id, {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
         serverInfo: { name: "meta-ads-csco", version: "1.0.0" },
       });
     }
-
-    if (method === "notifications/initialized") {
-      return res.status(200).end();
-    }
-
-    if (method === "tools/list") {
-      return reply({ tools: TOOLS });
-    }
-
+    if (method === "notifications/initialized") return res.status(200).json({});
+    if (method === "tools/list") return mcpReply(res, id, { tools: TOOLS });
     if (method === "tools/call") {
       const { name, arguments: args } = params;
       const result = await callTool(name, args || {});
-      return reply({
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      });
+      return mcpReply(res, id, { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] });
     }
-
-    return error(-32601, `Method not found: ${method}`);
+    return mcpError(res, id, -32601, `Method not found: ${method}`);
   } catch (e) {
-    return error(-32603, e.message);
+    return mcpError(res, id, -32603, e.message);
   }
 });
 
